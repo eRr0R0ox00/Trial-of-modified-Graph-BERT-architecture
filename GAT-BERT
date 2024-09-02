@@ -1,0 +1,121 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GATConv
+from torch_geometric.datasets import Planetoid
+from torch_geometric.transforms import NormalizeFeatures
+import dgl
+dgl.backend.pytorch
+
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+dataset = Planetoid(root='./', name='Pubmed', transform=NormalizeFeatures()).to(device)
+data = dataset[0].to(device)
+
+
+class FFN(nn.Module):
+    def __init__(self, ffn_in, ffn_hidden, ffn_out):
+        super(FFN, self).__init__()
+        self.MLP1 = nn.Linear(ffn_in, ffn_hidden)
+        self.MLP2 = nn.Linear(ffn_hidden, ffn_out)
+
+    def forward(self, x):
+        return self.MLP2(F.relu(self.MLP1(x)))
+
+class AddNorm(nn.Module):
+    def __init__(self, normalized_shape, dropout):
+        super(AddNorm, self).__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.ln = nn.LayerNorm(normalized_shape)
+ 
+    def forward(self, x, y):
+        return self.ln(self.dropout(y) + x)
+    
+class GAT(nn.Module):
+    def __init__(self, hidden_channels, heads):
+        super(GAT, self).__init__()
+        self.gat = GATConv(hidden_channels, hidden_channels, heads, concat=True)
+        self.linear = nn.Linear(hidden_channels * heads, hidden_channels)
+
+    def forward(self, x, edge_index):
+        y = self.gat(x, edge_index)
+        y = self.linear(y)
+        return y
+
+class GATEncoderLayer(nn.Module):
+    def __init__(self, hidden_channels, ffn_hidden, norm_shape, heads, dropout):
+        super(GATEncoderLayer, self).__init__()
+        self.gat = GAT(hidden_channels, heads)
+        self.addnorm1 = AddNorm(norm_shape, dropout)
+        self.ffn = FFN(hidden_channels, ffn_hidden, hidden_channels)
+        self.addnorm2 = AddNorm(norm_shape, dropout)
+
+    def forward(self, x, edge_index):
+        y = self.addnorm1(self.gat(x, edge_index), x)
+        return self.addnorm2(self.ffn(y), y)
+
+class GATEncoder(nn.Module):
+    def __init__(self, in_channels, hidden_channels, ffn_hidden, out_channels, norm_shape, heads, dropout, num_layers):
+        super(GATEncoder, self).__init__()
+        self.node_mapping = nn.Linear(in_channels, hidden_channels)
+        self.hidden_channels = hidden_channels
+        self.encoding_mapping = nn.Linear(hidden_channels, hidden_channels)
+
+        self.layers = nn.ModuleList()
+        self.layers.append(GATEncoderLayer(hidden_channels, ffn_hidden, norm_shape, heads, dropout))
+        for _ in range(1, num_layers):
+            self.layers.append(GATEncoderLayer(hidden_channels, ffn_hidden, norm_shape, heads, dropout))
+        
+        self.fc = nn.Linear(hidden_channels, out_channels)
+        
+    def forward(self, x, edge_index):
+        x = x.to(device)
+        edge_index = edge_index.to(device)
+        g_dgl = dgl.graph((data.edge_index[0].to(device), data.edge_index[1].to(device)), device=device)
+        pos_encoding = dgl.lap_pe(g_dgl, k=self.hidden_channels).to(device)
+        pos_encoding = self.encoding_mapping(pos_encoding[0])
+        #pos_enc_torch = torch.FloatTensor(pos_encoding)
+
+        x.squeeze(1)
+        x = self.node_mapping(x)
+        x = x + pos_encoding
+
+        for layer in self.layers:
+            x = layer(x, edge_index)
+        x = self.fc(x)
+        return F.log_softmax(x, dim=1)
+
+model = GATEncoder(in_channels=dataset.num_node_features,
+                   hidden_channels=64, 
+                   ffn_hidden=128,
+                   out_channels=dataset.num_classes, 
+                   norm_shape=[64], 
+                   heads=8, 
+                   dropout=0.3, 
+                   num_layers=2).to(device)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=5e-4)
+criterion = nn.CrossEntropyLoss()
+print("Using device:", device)
+
+def train():
+    model.train()
+    optimizer.zero_grad()
+    out = model(data.x, data.edge_index)
+    loss = criterion(out[data.train_mask], data.y[data.train_mask])
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+
+def test():
+    model.eval()
+    out = model(data.x, data.edge_index)
+    pred = out.argmax(dim=1)
+    correct = (pred[data.test_mask] == data.y[data.test_mask]).sum()
+    acc = int(correct) / int(data.test_mask.sum())
+    return acc
+
+for epoch in range(300):
+    loss = train()
+    acc = test()
+    if epoch % 10 == 0:
+        print(f'Epoch: {epoch}, Loss: {loss:.4f}, Test Accuracy: {acc:.4f}')
