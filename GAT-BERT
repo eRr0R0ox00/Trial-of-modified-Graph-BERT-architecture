@@ -73,7 +73,6 @@ class GATEncoder(nn.Module):
         g_dgl = dgl.graph((data.edge_index[0].to(device), data.edge_index[1].to(device)), device=device)
         pos_encoding = dgl.lap_pe(g_dgl, k=self.hidden_channels).to(device)
         pos_encoding = self.encoding_mapping(pos_encoding[0])
-        #pos_enc_torch = torch.FloatTensor(pos_encoding)
 
         x.squeeze(1)
         x = self.node_mapping(x)
